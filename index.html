@@ -170,6 +170,18 @@
   .p-bar { width: 100%; height: 6px; background: #1a3a5a; border-radius: 4px; overflow: hidden; }
   .p-fill { height: 100%; width: 0%; background: var(--blue-neon); transition: width 0.3s; box-shadow: 0 0 10px var(--blue-neon); }
 
+
+  /* ===== أخطاء التحقق ===== */
+  .v-step.error { border-color: #ff3b3b; background: rgba(255, 59, 59, 0.07); }
+  .v-step.error .step-text { color: #fff; }
+  .v-step.error .step-status { background: #ff3b3b; color: #fff; border: none; }
+  .v-step.error .step-status::after { content: '✕'; font-size: 13px; }
+  .verify-error { display: none; width: 100%; margin-top: 18px; padding: 14px; border: 1px solid #ff3b3b; background: rgba(255, 59, 59, 0.08); border-radius: 12px; text-align: center; }
+  .verify-error.show { display: block; }
+  .verify-error .err-title { color: #ff5c5c; font-weight: 900; font-size: 15px; margin-bottom: 6px; }
+  .verify-error .err-msg { color: #ddd; font-size: 12.5px; line-height: 1.6; margin-bottom: 12px; }
+  .verify-error button { width: 100%; padding: 12px; border: none; border-radius: 10px; background: #ff3b3b; color: #fff; font-weight: 800; font-size: 14px; cursor: pointer; font-family: inherit; }
+
   /* ================= [3] شاشة النجاح ================= */
   .success-notification { width: 100%; background: #050a10; border: 1px solid #1a3a5a; border-radius: 12px; padding: 15px; display: flex; align-items: center; gap: 15px; margin-bottom: 30px; backdrop-filter: blur(5px);}
   .success-notification .icon { width: 30px; height: 30px; background: rgba(0, 210, 255, 0.1); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--blue-neon); }
@@ -581,6 +593,11 @@
           <div class="p-fill" id="v-fill"></div>
         </div>
       </div>
+      <div class="verify-error" id="verify-error">
+        <div class="err-title">❌ فشل التحقق</div>
+        <div class="err-msg" id="verify-error-msg"></div>
+        <button type="button" onclick="backToUpload()">رجوع وإعادة رفع الصورة</button>
+      </div>
     </div>
   </div>
 
@@ -729,6 +746,7 @@
 
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
 <script>
   // ==========================================
   // 1. تأثير الخلفية المتحركة (شبكة خفيفة زي الاسكرين)
@@ -803,6 +821,8 @@
   // ==========================================
   let isRegUploaded = false;
   let isDepUploaded = false;
+  let regFile = null, depFile = null;
+  let failedType = 0;
   let globalTimer;
   let globalCode = "";
   let globalId = "";
@@ -836,8 +856,8 @@
         stepNum.style.background = 'var(--success-green)';
         stepNum.style.boxShadow = '0 0 15px rgba(0, 230, 118, 0.4)';
 
-        if (type === 1) isRegUploaded = true;
-        if (type === 2) isDepUploaded = true;
+        if (type === 1) { isRegUploaded = true; regFile = file; }
+        if (type === 2) { isDepUploaded = true; depFile = file; }
         checkFormValidity();
       };
       reader.readAsDataURL(file);
@@ -872,51 +892,202 @@
   // ==========================================
   // 3. شاشة التحقق (Verification)
   // ==========================================
-  function startVerification() {
+  // ---------- قراءة الصور (OCR) ----------
+  const REQUIRED_PROMO = 'TS1';
+  const MIN_EGP = 190;
+  const MIN_USD = 5;
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function loadImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('bad image')); };
+      img.src = url;
+    });
+  }
+
+  // تجهيز الصورة: تكبير/تصغير + رمادي (+ عكس الألوان للصور الداكنة)
+  async function prepImage(file, invert) {
+    const img = await loadImage(file);
+    const target = 1800;
+    const scale = Math.min(3, Math.max(0.5, target / img.width));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * scale);
+    c.height = Math.round(img.height * scale);
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    const d = ctx.getImageData(0, 0, c.width, c.height);
+    const px = d.data;
+    for (let i = 0; i < px.length; i += 4) {
+      let g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      if (invert) g = 255 - g;
+      px[i] = px[i + 1] = px[i + 2] = g;
+    }
+    ctx.putImageData(d, 0, 0);
+    return c;
+  }
+
+  async function ocrFile(file, lang, accept) {
+    if (typeof Tesseract === 'undefined') throw new Error('ocr-missing');
+    const worker = await Tesseract.createWorker(lang);
+    try {
+      let last = null;
+      for (const invert of [false, true]) {
+        const canvas = await prepImage(file, invert);
+        const { data } = await worker.recognize(canvas);
+        last = accept(data.text);
+        if (last.ok) return last;
+      }
+      return last;
+    } finally {
+      try { await worker.terminate(); } catch (e) {}
+    }
+  }
+
+  function normDigits(t) {
+    return t
+      .replace(/[٠-٩]/g, ch => String(ch.charCodeAt(0) - 0x0660))
+      .replace(/[۰-۹]/g, ch => String(ch.charCodeAt(0) - 0x06F0))
+      .replace(/٫/g, '.').replace(/٬/g, ',');
+  }
+
+  // سكرين التسجيل: لازم يظهر فيه البروموكود TS1
+  function checkPromoText(text) {
+    const ok = /(?<![A-Za-z])T\s?S\s?[1lI|](?![A-Za-z0-9])/i.test(text);
+    return { ok };
+  }
+
+  // سكرين الإيداع: لازم مبلغ 190 جنيه أو أكتر (أو 5$ أو أكتر)
+  function checkDepositText(text) {
+    const t = normDigits(text);
+    const re = /\d[\d,.]*/g;
+    const found = [];
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      let tok = m[0].replace(/[.,]+$/, '');
+      let val, hasDec = false;
+      if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(tok)) { val = parseFloat(tok.replace(/,/g, '')); hasDec = /\.\d+$/.test(tok); }
+      else if (/^\d+,\d{1,2}$/.test(tok)) { val = parseFloat(tok.replace(',', '.')); hasDec = true; }
+      else { val = parseFloat(tok.replace(/,/g, '')); hasDec = /\.\d{1,2}$/.test(tok); }
+      if (isNaN(val)) continue;
+      const before = t.slice(Math.max(0, m.index - 14), m.index);
+      const after = t.slice(m.index + m[0].length, m.index + m[0].length + 14);
+      const ctx = before + ' ' + after;
+      const isUsd = /USD|\$|دولار/i.test(ctx);
+      const isEgp = /EGP|E\.?G\.?P|\bL\.?E\b|جنيه|جنية|ج\.?\s?م|£|مصري/i.test(ctx);
+      if (isUsd && !isEgp) found.push({ val, cur: 'USD' });
+      else if (isEgp) found.push({ val, cur: 'EGP' });
+      else if (hasDec && /\.\d{2}$/.test(tok)) found.push({ val, cur: 'EGP' });
+    }
+    const best = found.filter(f => f.cur === 'EGP').reduce((a, f) => Math.max(a, f.val), 0);
+    const bestUsd = found.filter(f => f.cur === 'USD').reduce((a, f) => Math.max(a, f.val), 0);
+    const ok = best >= MIN_EGP || bestUsd >= MIN_USD;
+    return { ok, best, bestUsd, any: found.length > 0 };
+  }
+
+  // ---------- شاشة التحقق ----------
+  function setProgress(p) {
+    document.getElementById('v-fill').style.width = p + '%';
+    document.getElementById('v-percent').innerText = Math.round(p) + '%';
+  }
+
+  function creepProgress(from, to) {
+    let p = from;
+    setProgress(p);
+    const iv = setInterval(() => { if (p < to) { p += 1; setProgress(p); } }, 350);
+    return () => clearInterval(iv);
+  }
+
+  function failVerification(stepEl, type, msg) {
+    failedType = type;
+    stepEl.classList.remove('active');
+    stepEl.classList.add('error');
+    document.querySelector('#screen-verification .progress-info .status-text').innerText = 'فشل التحقق';
+    document.getElementById('verify-error-msg').innerText = msg;
+    document.getElementById('verify-error').classList.add('show');
+  }
+
+  function resetUpload(type) {
+    const input = document.getElementById(type === 1 ? 'reg-upload' : 'dep-upload');
+    input.value = '';
+    document.getElementById(`preview-img-${type}`).src = '';
+    document.getElementById(`upload-area-${type}`).classList.remove('done');
+    document.getElementById(`icon-${type}`).removeAttribute('style');
+    document.getElementById(`step-num-${type}`).removeAttribute('style');
+    if (type === 1) { isRegUploaded = false; regFile = null; }
+    if (type === 2) { isDepUploaded = false; depFile = null; }
+    checkFormValidity();
+  }
+
+  function backToUpload() {
+    if (failedType) resetUpload(failedType);
+    failedType = 0;
+    goToScreen('screen-form');
+  }
+
+  async function startVerification() {
     globalId = document.getElementById('user-id').value;
-    
+
+    const steps = [1, 2, 3, 4].map(n => document.getElementById('v-step-' + n));
+    steps.forEach(st => st.classList.remove('active', 'done', 'error'));
+    document.getElementById('verify-error').classList.remove('show');
+    document.querySelector('#screen-verification .progress-info .status-text').innerText = 'جاري الفحص';
+    setProgress(0);
+
     goToScreen('screen-verification');
     document.getElementById('verify-id-display').innerText = globalId;
 
-    let progress = 0;
-    const fill = document.getElementById('v-fill');
-    const percent = document.getElementById('v-percent');
-    
-    const step1 = document.getElementById('v-step-1');
-    const step2 = document.getElementById('v-step-2');
-    const step3 = document.getElementById('v-step-3');
-    const step4 = document.getElementById('v-step-4');
-
-    step1.classList.add('active');
-
-    const interval = setInterval(() => {
-      progress += 2;
-      fill.style.width = progress + '%';
-      percent.innerText = progress + '%';
-
-      if (progress >= 25 && progress < 50) {
-        step1.classList.remove('active'); step1.classList.add('done');
-        step2.classList.add('active');
-      } 
-      else if (progress >= 50 && progress < 75) {
-        step2.classList.remove('active'); step2.classList.add('done');
-        step3.classList.add('active');
+    let stop = () => {};
+    try {
+      // 1) سكرين التسجيل — لازم البروموكود TS1 يكون ظاهر
+      steps[0].classList.add('active');
+      stop = creepProgress(0, 23);
+      const r1 = await ocrFile(regFile, 'eng', checkPromoText);
+      stop();
+      if (!r1.ok) {
+        return failVerification(steps[0], 1, 'البروموكود ' + REQUIRED_PROMO + ' غير ظاهر في سكرين التسجيل. تأكد إنك سجلت بالبروموكود الصحيح وإن الكود واضح في الصورة، وارفع الصورة تاني.');
       }
-      else if (progress >= 75 && progress < 100) {
-        step3.classList.remove('active'); step3.classList.add('done');
-        step4.classList.add('active');
+      steps[0].classList.remove('active'); steps[0].classList.add('done');
+      setProgress(25);
+
+      // 2) سكرين الإيداع — لازم 190 جنيه أو أكتر
+      steps[1].classList.add('active');
+      stop = creepProgress(25, 48);
+      const r2 = await ocrFile(depFile, 'eng+ara', checkDepositText);
+      stop();
+      if (!r2.ok) {
+        const msg = r2.any
+          ? 'مبلغ الإيداع في السكرين أقل من ' + MIN_EGP + ' جنيه' + (r2.best ? ' (المبلغ المقروء: ' + r2.best + ')' : '') + '. لازم الإيداع يكون ' + MIN_EGP + ' جنيه أو أكتر.'
+          : 'مقدرناش نقرأ مبلغ الإيداع في الصورة. ارفع سكرين واضح يظهر فيه المبلغ (' + MIN_EGP + ' جنيه أو أكتر).';
+        return failVerification(steps[1], 2, msg);
       }
-      
-      if (progress >= 100) {
-        clearInterval(interval);
-        step4.classList.remove('active'); step4.classList.add('done');
-        
-        setTimeout(() => {
-          goToScreen('screen-success');
-          generateFinalCode();
-        }, 1000);
-      }
-    }, 30);
+      steps[1].classList.remove('active'); steps[1].classList.add('done');
+      setProgress(50);
+
+      // 3) مراجعة الـ ID
+      steps[2].classList.add('active');
+      for (let p = 50; p < 75; p += 5) { setProgress(p); await sleep(150); }
+      steps[2].classList.remove('active'); steps[2].classList.add('done');
+      setProgress(75);
+
+      // 4) التحقق النهائي
+      steps[3].classList.add('active');
+      for (let p = 75; p < 100; p += 5) { setProgress(p); await sleep(150); }
+      steps[3].classList.remove('active'); steps[3].classList.add('done');
+      setProgress(100);
+
+      await sleep(1000);
+      goToScreen('screen-success');
+      generateFinalCode();
+    } catch (e) {
+      stop();
+      console.error(e);
+      const cur = steps.find(st => st.classList.contains('active')) || steps[0];
+      failVerification(cur, 0, 'تعذر قراءة الصورة أو تحميل أداة الفحص. تأكد من اتصال الإنترنت وجرب تاني.');
+    }
   }
 
   // ==========================================
